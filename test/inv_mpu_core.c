@@ -353,16 +353,16 @@ static void __init mpu6000_init_device(void)
 	spi_message_free(spi_msg);
 }
 
-static struct spi_transfer initialise[] = {	
-	{ .tx_buf = &bufPwrReset,	.rx_buf = NULL,	.len = sizeof(__be16),	.cs_change = 1,	.delay_usecs = 40000 }	/*reset*/
-	{ .tx_buf = &bufDisI2C,		.rx_buf = NULL,	.len = sizeof(__be16),	.cs_change = 1 }	/*disable device i2c slave interface, enable i2c master mode, reset master*/
-	{ .tx_buf = &bufUserCtrl,	.rx_buf = NULL,	.len = sizeof(__be16),	.cs_change = 1 }	/*reset signal paths, fifos and device i2c master */
-};
+//static struct spi_transfer initialise[] = {	
+//	{ .tx_buf = &bufPwrReset,	.rx_buf = NULL,	.len = sizeof(__be16),	.cs_change = 1,	.delay_usecs = 40000 }	/*reset*/
+//	{ .tx_buf = &bufDisI2C,		.rx_buf = NULL,	.len = sizeof(__be16),	.cs_change = 1 }	/*disable device i2c slave interface, enable i2c master mode, reset master*/
+//	{ .tx_buf = &bufUserCtrl,	.rx_buf = NULL,	.len = sizeof(__be16),	.cs_change = 1 }	/*reset signal paths, fifos and device i2c master */
+//};
 
 
 static int __init mpu6000_init_spi(void)
 {
-	int error;
+	int error = 0;
 
 	/*mpu6050_ctl.tx_buff = kmalloc(SPI_BUFF_SIZE, GFP_KERNEL);
 	if (!spike_ctl.tx_buff) {
@@ -456,12 +456,18 @@ static int __init mpu6000_init_spi(void)
 	spi_message_add_tail(&spi_writePwrSet, spi_msg);
 	spi_message_add_tail(&spi_writeBufDisI2C, spi_msg);*/
 
-	error = spi_sync(mpu6000_dev.spi_device, spi_msg);
+	//error = spi_sync(mpu6000_dev.spi_device, spi_msg);
 	if (error < 0)
 	{
 		printk("failed to send message\n");
 		goto failed;
 	}
+	
+	spi_write (	mpu6000_dev.spi_device, &bufPwrReset, sizeof(__be16));
+	msleep(40);
+	bufRes = spi_w8r8 (	mpu6000_dev.spi_device, INV_MPU60x0_WHO_AM_I|REGREAD);
+ 
+ 	
 	printk("device id is: %X\n", bufRes);
 
 	spi_message_free(spi_msg);

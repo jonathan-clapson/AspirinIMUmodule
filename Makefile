@@ -1,9 +1,9 @@
 #
-# Makefile for Invensense MPU6000 device.
+# Makefile for Invensense MPU6050 device.
 #
 
-obj-m := inv-mpu6000.o
-inv-mpu6000-objs := inv_mpu_core.o
+obj-m := inv-mpu60x0.o
+inv-mpu60x0-objs := inv_mpu_core_spi.o mpu60x0/inv_mpu_ring.o mpu60x0/inv_mpu_trigger.o
 
 KDIR := /mnt/scratch/repos/linux
 
