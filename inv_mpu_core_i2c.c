@@ -23,7 +23,7 @@
 #include <linux/interrupt.h>
 #include <linux/kfifo.h>
 #include <linux/spinlock.h>
-#include "inv_mpu_iio.h"
+#include "mpu60x0/inv_mpu_iio.h"
 
 /*
  * this is the gyro scale translated from dynamic range plus/minus

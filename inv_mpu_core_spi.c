@@ -14,7 +14,7 @@
 #include <linux/module.h>
 #include <linux/init.h>
 #include <linux/slab.h>
-#include <linux/i2c.h>
+#include <linux/spi/spi.h>
 #include <linux/err.h>
 #include <linux/delay.h>
 #include <linux/sysfs.h>
@@ -23,7 +23,21 @@
 #include <linux/interrupt.h>
 #include <linux/kfifo.h>
 #include <linux/spinlock.h>
-#include "inv_mpu_iio.h"
+#include <linux/semaphore.h>
+#include "mpu60x0/inv_mpu_iio.h"
+
+
+#define REGADDR(addr)	((u16)addr<<8)
+#define REGREAD 		(0x80)
+#define SPIWRITEREG(addr, data) (cpu_to_be16((REGADDR(addr))|(data)))
+#define SPIREADREG(addr) (cpu_to_be16(REGREAD|REGADDR(addr)))
+
+#define SPI_BUS 0
+#define SPI_BUS_CS0 0
+#define SPI_BUS_CS1 1
+#define SPI_BUS_SPEED 1000000 //1MHz
+
+const char this_driver_name[] = "MPU60x0";
 
 /*
  * this is the gyro scale translated from dynamic range plus/minus
@@ -72,9 +86,36 @@ static const struct inv_mpu60x0_hw hw_info[INV_NUM_PARTS] = {
 	},
 };
 
+
+
 int inv_mpu60x0_write_reg(struct inv_mpu60x0_state *st, int reg, u8 d)
+{	
+	__be16 buf = SPIWRITEREG(reg, d);
+	struct spi_transfer spi_transaction = { 
+		.tx_buf = &buf,
+		.len = sizeof(__be16),
+		.cs_change = 1 
+	};
+		
+	return spi_sync_transfer (st->spi_dev, &spi_transaction, 1);
+}
+int inv_mpu60x0_read_reg(struct inv_mpu60x0_state *st, int reg, u8 *d)
 {
-	return i2c_smbus_write_i2c_block_data(st->client, reg, 1, &d);
+	int error;
+	
+	__be16 buf = SPIREADREG(reg);
+	__be16 readBuf;
+	struct spi_transfer spi_transaction = { 
+		.tx_buf = &buf,
+		.rx_buf = &readBuf,
+		.len = sizeof(__be16),
+		.cs_change = 1 
+	};
+		
+	error = spi_sync_transfer (st->spi_dev, &spi_transaction, 1);
+	*d = (u8) be16_to_cpu(readBuf);
+	
+	return error;	
 }
 
 int inv_mpu60x0_switch_engine(struct inv_mpu60x0_state *st, bool en, u32 mask)
@@ -85,10 +126,10 @@ int inv_mpu60x0_switch_engine(struct inv_mpu60x0_state *st, bool en, u32 mask)
 	/* switch clock needs to be careful. Only when gyro is on, can
 	   clock source be switched to gyro. Otherwise, it must be set to
 	   internal clock */
+	/* get the current value of power management 1 register and clear lower 3 (clock) bits */
 	if (INV_MPU60x0_BIT_PWR_GYRO_STBY == mask) {
-		result = i2c_smbus_read_i2c_block_data(st->client,
-				       st->reg->pwr_mgmt_1, 1, &mgmt_1);
-		if (result != 1)
+		result = inv_mpu60x0_read_reg(st, st->reg->pwr_mgmt_1, &mgmt_1);
+		if (result < 0)
 			return result;
 
 		mgmt_1 &= ~INV_MPU60x0_BIT_CLK_MASK;
@@ -103,9 +144,8 @@ int inv_mpu60x0_switch_engine(struct inv_mpu60x0_state *st, bool en, u32 mask)
 			return result;
 	}
 
-	result = i2c_smbus_read_i2c_block_data(st->client,
-				       st->reg->pwr_mgmt_2, 1, &d);
-	if (result != 1)
+	result = inv_mpu60x0_read_reg(st, st->reg->pwr_mgmt_2, &d);
+	if (result < 0)
 		return result;
 	if (en)
 		d &= ~mask;
@@ -199,12 +239,19 @@ static int inv_mpu60x0_sensor_show(struct inv_mpu60x0_state  *st, int reg,
 {
 	int ind, result;
 	__be16 d;
+	u8 ld, ud;
 
 	ind = (axis - IIO_MOD_X) * 2;
-	result = i2c_smbus_read_i2c_block_data(st->client, reg + ind,  2,
-						(u8 *)&d);
-	if (result != 2)
+	/* done to here */
+	result = inv_mpu60x0_read_reg(st, reg+ind, &ld);
+	if (result < 0 )
 		return -EINVAL;
+		
+	result = inv_mpu60x0_read_reg(st, reg+ind+1, &ud);
+	if (result < 0)
+		return -EINVAL;
+		
+	d = (__be16)(ud<<8) | (__be16)(ld);
 	*val = (short)be16_to_cpup(&d);
 
 	return IIO_VAL_INT;
@@ -648,13 +695,89 @@ static int inv_check_and_setup_chip(struct inv_mpu60x0_state *st,
 	return 0;
 }
 
+static int __init add_device_to_bus(void)
+{
+	struct spi_master *spi_master;
+	struct spi_device *spi_device;
+	struct device *pdev;
+	char buff[64];
+	int status = 0;
+
+	spi_master = spi_busnum_to_master(SPI_BUS);
+	if (!spi_master) {
+		printk(KERN_ALERT "spi_busnum_to_master(%d) returned NULL\n",
+			SPI_BUS);
+		printk(KERN_ALERT "Missing modprobe omap2_mcspi?\n");
+		return -1;
+	}
+
+	spi_device = spi_alloc_device(spi_master);
+	if (!spi_device) {
+		put_device(&spi_master->dev);
+		printk(KERN_ALERT "spi_alloc_device() failed\n");
+		return -1;
+	}
+
+	/* specify a chip select line */
+	spi_device->chip_select = SPI_BUS_CS0;
+
+	/* Check whether this SPI bus.cs is already claimed */
+	snprintf(buff, sizeof(buff), "%s.%u",
+			dev_name(&spi_device->master->dev),
+			spi_device->chip_select);
+
+	pdev = bus_find_device_by_name(spi_device->dev.bus, NULL, buff);
+ 	if (pdev) {
+		/* We are not going to use this spi_device, so free it */
+		spi_dev_put(spi_device);
+
+ 		printk("bus is claimed!\n");
+
+		/*
+		 * There is already a device configured for this bus.cs combination.
+		 * It's okay if it's us. This happens if we previously loaded then
+		 * unloaded our driver.
+		 * If it is not us, we complain and fail.
+		 */
+		if (pdev->driver && pdev->driver->name &&
+				strcmp(this_driver_name, pdev->driver->name)) {
+			printk(KERN_ALERT
+				"Driver [%s] already registered for %s\n",
+				pdev->driver->name, buff);
+			status = -1;
+		}
+	} else {
+		printk("bus is free!\n");
+
+		spi_device->max_speed_hz = SPI_BUS_SPEED;
+		spi_device->mode = SPI_MODE_3;
+		spi_device->bits_per_word = 8;
+		spi_device->irq = -1;
+		spi_device->controller_state = NULL;
+		spi_device->controller_data = NULL;
+		strlcpy(spi_device->modalias, this_driver_name, SPI_NAME_SIZE);
+		status = spi_add_device(spi_device);
+
+		if (status < 0) {
+			spi_dev_put(spi_device);
+			printk(KERN_ALERT "spi_add_device() failed: %d\n",
+				status);
+		}
+	}
+
+	put_device(&spi_master->dev);
+	printk("loaded!\n");
+
+	return status;
+}
+
 /**
  *  inv_mpu_probe() - probe function.
  *  @client:          i2c client.
  *  @id:              i2c device id.
  *
  *  Returns 0 on success, a negative error code otherwise.
- */
+ *
 static int inv_mpu_probe(struct i2c_client *client,
 	const struct i2c_device_id *id)
 {
@@ -677,7 +800,7 @@ static int inv_mpu_probe(struct i2c_client *client,
 	st->client = client;
 	st->plat_data = *(struct inv_mpu60x0_platform_data
 				*)dev_get_platdata(&client->dev);
-	/* power is turned on inside check chip type*/
+	// power is turned on inside check chip type
 	result = inv_check_and_setup_chip(st, id);
 	if (result)
 		goto out_free;
@@ -732,21 +855,106 @@ out_free:
 out_no_free:
 
 	return result;
+}*/
+
+static int inv_mpu_probe(struct spi_device *spi_device)
+{
+	struct iio_dev *indio_dev;
+	struct inv_mpu60x0_state *st;
+	int result; 
+	
+	result = add_device_to_bus();
+	if (result < 0)
+		goto out_no_free;
+		
+	indio_dev = iio_device_alloc(sizeof(*st));
+	if (indio_dev == NULL) {
+		result = -ENOMEM;
+		goto out_no_free;
+	}
+	st = iio_priv(indio_dev);
+	st->spi_dev = spi_device;
+	st->plat_data = *(struct inv_mpu60x0_platform_data
+				*)dev_get_platdata(&client->dev);
+	// power is turned on inside check chip type
+	result = inv_check_and_setup_chip(st, id);
+	if (result)
+		goto out_free;
+
+	result = inv_mpu60x0_init_config(indio_dev);
+	if (result) {
+		dev_err(&client->dev,
+			"Could not initialize device.\n");
+		goto out_free;
+	}
+
+	i2c_set_clientdata(client, indio_dev);
+	indio_dev->dev.parent = &client->dev;
+	indio_dev->name = id->name;
+	indio_dev->channels = inv_mpu_channels;
+	indio_dev->num_channels = ARRAY_SIZE(inv_mpu_channels);
+
+	indio_dev->info = &mpu_info;
+	indio_dev->modes = INDIO_BUFFER_TRIGGERED;
+
+	result = iio_triggered_buffer_setup(indio_dev,
+					    inv_mpu60x0_irq_handler,
+					    inv_mpu60x0_read_fifo,
+					    NULL);
+	if (result) {
+		dev_err(&st->client->dev, "configure buffer fail %d\n",
+				result);
+		goto out_free;
+	}
+	result = inv_mpu60x0_probe_trigger(indio_dev);
+	if (result) {
+		dev_err(&st->client->dev, "trigger probe fail %d\n", result);
+		goto out_unreg_ring;
+	}
+
+	INIT_KFIFO(st->timestamps);
+	spin_lock_init(&st->time_stamp_lock);
+	result = iio_device_register(indio_dev);
+	if (result) {
+		dev_err(&st->client->dev, "IIO register fail %d\n", result);
+		goto out_remove_trigger;
+	}
+	
+out_remove_trigger:
+	inv_mpu60x0_remove_trigger(st);
+out_unreg_ring:
+	iio_triggered_buffer_cleanup(indio_dev);
+out_free:
+	iio_device_free(indio_dev);
+out_no_free:
+
+	return result;
 }
 
-static int inv_mpu_remove(struct i2c_client *client)
+static int mpu6000_probe()
 {
-	struct iio_dev *indio_dev = i2c_get_clientdata(client);
-	struct inv_mpu60x0_state *st = iio_priv(indio_dev);
+	
 
-	iio_device_unregister(indio_dev);
-	inv_mpu60x0_remove_trigger(st);
-	iio_triggered_buffer_cleanup(indio_dev);
-	iio_device_free(indio_dev);
+	mpu6000_dev.spi_device = spi_device;
+
+	up(&mpu6000_dev.spi_sem);
 
 	return 0;
 }
-#ifdef CONFIG_PM_SLEEP
+
+static int inv_mpu_remove(struct spi_device *spi_device)
+{
+	if (down_interruptible(&mpu6000_dev.spi_sem))
+		return -EBUSY;
+
+	mpu6000_dev.spi_device = NULL;
+
+	up(&mpu6000_dev.spi_sem);
+
+	return 0;
+}
+
+/*#ifdef CONFIG_PM_SLEEP
 
 static int inv_mpu_resume(struct device *dev)
 {
@@ -764,18 +972,31 @@ static SIMPLE_DEV_PM_OPS(inv_mpu_pmops, inv_mpu_suspend, inv_mpu_resume);
 #define INV_MPU60x0_PMOPS (&inv_mpu_pmops)
 #else
 #define INV_MPU60x0_PMOPS NULL
-#endif /* CONFIG_PM_SLEEP */
+#endif */ /* CONFIG_PM_SLEEP */
+
+
+static struct spi_driver mpu6000_driver = {
+	.driver = {
+		.name 		= this_driver_name,
+		.owner		= THIS_MODULE,
+//		.pm			= INV_MPU60x0_PMOPS,
+	},
+
+	.probe = inv_mpu_probe,
+	.remove = inv_mpu_remove,
+	//.suspend = mpu6000_suspend,
+	//.resume = mpu6000_resume,
+};
+
 
 /*
- * device id table is used to identify what device can be
- * supported by this driver
- */
 static const struct i2c_device_id inv_mpu_id[] = {
 	{"mpu60x0", INV_MPU60x0},
 	{}
 };
 
 MODULE_DEVICE_TABLE(i2c, inv_mpu_id);
+
 
 static struct i2c_driver inv_mpu_driver = {
 	.probe		=	inv_mpu_probe,
@@ -788,8 +1009,8 @@ static struct i2c_driver inv_mpu_driver = {
 	},
 };
 
-module_i2c_driver(inv_mpu_driver);
+module_i2c_driver(inv_mpu_driver);*/
 
-MODULE_AUTHOR("Invensense Corporation");
+MODULE_AUTHOR("Jonathan Clapson");
 MODULE_DESCRIPTION("Invensense device MPU60x0 driver");
 MODULE_LICENSE("GPL");
